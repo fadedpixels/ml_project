@@ -1532,7 +1532,24 @@
 
       // Market status
       const m = data.market || {};
-      document.getElementById('market-status-text').textContent = (m.status || 'OPEN').toUpperCase();
+      const statusStr = (m.status || 'open').toLowerCase();
+      const statusPillText = document.getElementById('market-status-text');
+      const pulseDot = document.getElementById('market-pulse');
+
+      if (statusStr === 'live') {
+        statusPillText.textContent = 'LIVE (MASSIVE API)';
+        pulseDot.className = 'pulse-dot';
+      } else if (statusStr === 'closed') {
+        statusPillText.textContent = 'CLOSED (OUT-OF-SAMPLE REPLAY)';
+        pulseDot.className = 'pulse-dot amber';
+      } else if (statusStr === 'replay') {
+        statusPillText.textContent = 'REPLAY (OUT-OF-SAMPLE)';
+        pulseDot.className = 'pulse-dot amber';
+      } else {
+        statusPillText.textContent = statusStr.toUpperCase();
+        pulseDot.className = 'pulse-dot';
+      }
+
       document.getElementById('data-age-text').textContent = (m.data_age_s || 0) + 's ago';
       document.getElementById('clock-et').textContent = m.now_et || '--:--:-- ET';
 
@@ -1728,8 +1745,13 @@
       const ls = data.live_score || {};
       document.getElementById('live-kpi-signals').textContent = ls.signals || 0;
       document.getElementById('live-kpi-resolved').textContent = (ls.resolved || 0) + ' resolved';
-      document.getElementById('live-kpi-wr').textContent = (ls.win_rate != null ? ls.win_rate.toFixed(1) : '--') + '%';
-      document.getElementById('live-kpi-ci').textContent = '±' + (ls.ci ? ls.ci.toFixed(1) : '0.0') + '%';
+      if (ls.win_rate != null) {
+        document.getElementById('live-kpi-wr').textContent = Number(ls.win_rate).toFixed(1) + '%';
+        document.getElementById('live-kpi-ci').textContent = '±' + (ls.ci ? Number(ls.ci).toFixed(1) : '0.0') + '% (Wilson)';
+      } else {
+        document.getElementById('live-kpi-wr').textContent = '—';
+        document.getElementById('live-kpi-ci').textContent = 'Need ≥ 20 signals';
+      }
       const pnlVal = ls.net_pnl_pct || 0;
       const pnlElem = document.getElementById('live-kpi-pnl');
       pnlElem.textContent = (pnlVal >= 0 ? '+' : '') + pnlVal.toFixed(2) + '%';

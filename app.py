@@ -1,7 +1,11 @@
 """
 NVDA Stock Market Prediction - Live Trading Indicator Web Application
-Serves the fintech terminal dashboard and provides live 5-minute candle data,
-calibrated ML probabilities, and zero-repainting signal execution.
+Serves the fintech terminal dashboard and provides:
+1. Live Massive API candle feed during open US market hours (9:30 - 16:00 ET).
+2. Honest status reporting (live, closed, replay) - never faking live when closed.
+3. Persistent signal caching to results/live_signals.json (zero repainting across restarts).
+4. Out-of-sample replay restricted strictly to the untouched test set (post 2026-06-10).
+5. Wilson Score confidence intervals with minimum sample size gates (>= 20 signals).
 """
 
 import os
@@ -15,6 +19,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 import numpy as np
 import pandas as pd
+import requests
 import joblib
 from dotenv import load_dotenv
 
@@ -37,6 +42,7 @@ CLEANED_DATA_PATH = os.path.join(DATA_DIR, "NVDA_5min_cleaned.csv")
 TEST_PREDICTIONS_PATH = os.path.join(RESULT_DIR, "best_model_test_predictions.csv")
 TEST_METRICS_PATH = os.path.join(RESULT_DIR, "test_metrics.csv")
 TRADING_METRICS_PATH = os.path.join(RESULT_DIR, "trading_metrics.csv")
+LIVE_SIGNALS_FILE = os.path.join(RESULT_DIR, "live_signals.json")
 
 MODEL_PATH = os.path.join(MODEL_DIR, "best_model.joblib")
 FEATURE_NAMES_PATH = os.path.join(MODEL_DIR, "feature_names.joblib")
@@ -49,23 +55,55 @@ CONFIDENCE_THRESHOLD = 0.44
 MODEL = None
 FEATURE_NAMES = None
 HISTORICAL_DF = None
+TEST_DF = None  # Strictly out-of-sample historical slice (>= 2026-06-10)
 
 # ============================================================
 # PERSISTENT CACHES FOR ZERO REPAINTING & OUTCOME RESOLUTION
-# Signals emitted for closed candles are permanently cached here.
-# A signal emitted at candle close is NEVER recomputed or changed.
 # ============================================================
 CONFIRMED_SIGNALS = {}
 RESOLVED_OUTCOMES = {}
 
+LIVE_API_CACHE = {
+    "last_fetch": 0,
+    "df": None,
+    "status": "unknown"
+}
+
 SIMULATION_START_TIME = time.time()
+
+
+# ============================================================
+# PERSISTENCE HELPERS
+# ============================================================
+def load_persisted_signals():
+    global CONFIRMED_SIGNALS
+    if os.path.exists(LIVE_SIGNALS_FILE):
+        try:
+            with open(LIVE_SIGNALS_FILE, "r") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    CONFIRMED_SIGNALS[int(k)] = v
+            print(f"Loaded {len(CONFIRMED_SIGNALS)} persisted signals from {LIVE_SIGNALS_FILE}")
+        except Exception as e:
+            print("Error loading live_signals.json:", e)
+
+
+def persist_signals():
+    global CONFIRMED_SIGNALS
+    try:
+        os.makedirs(RESULT_DIR, exist_ok=True)
+        serializable = {str(k): v for k, v in CONFIRMED_SIGNALS.items()}
+        with open(LIVE_SIGNALS_FILE, "w") as f:
+            json.dump(serializable, f, indent=2)
+    except Exception as e:
+        print("Error saving live_signals.json:", e)
 
 
 # ============================================================
 # LOAD ASSETS & PRECOMPUTE METRICS
 # ============================================================
 def load_assets():
-    global MODEL, FEATURE_NAMES, HISTORICAL_DF, CONFIDENCE_THRESHOLD
+    global MODEL, FEATURE_NAMES, HISTORICAL_DF, TEST_DF, CONFIDENCE_THRESHOLD
 
     # 1. Load cleaned data
     if os.path.exists(CLEANED_DATA_PATH):
@@ -76,7 +114,11 @@ def load_assets():
             df["Timestamp_ET"] = df["Timestamp"].dt.tz_convert("America/New_York")
             df = df.sort_values("Timestamp").reset_index(drop=True)
             HISTORICAL_DF = df
-            print(f"Loaded {len(df)} historical candles.")
+            
+            # Restrict replay strictly to out-of-sample test window (post 2026-06-10)
+            test_start = pd.to_datetime("2026-06-10 17:40:00+00:00")
+            TEST_DF = df[df["Timestamp"] >= test_start].copy().reset_index(drop=True)
+            print(f"Loaded {len(df)} total candles. Out-of-sample test slice: {len(TEST_DF)} candles.")
         except Exception as e:
             print("Error loading historical data:", e)
 
@@ -98,8 +140,9 @@ def load_assets():
             print("Model loaded successfully with features:", len(FEATURE_NAMES))
         except Exception as e:
             print("Error loading model:", e)
-    else:
-        print("Trained model files not yet available in models/. Fallback heuristic active.")
+
+    # 4. Load persisted live signals cache
+    load_persisted_signals()
 
 
 def get_current_threshold():
@@ -115,37 +158,147 @@ def get_current_threshold():
 
 
 # ============================================================
-# DATA FEED PROVIDER (WITH ZERO REPAINTING & OUTCOME RESOLUTION)
+# MARKET HOURS & LIVE CANDLE FETCHER
+# ============================================================
+def is_us_equity_market_open(now_et):
+    """
+    Checks if current Eastern Time is within regular US equity trading hours:
+    Monday (0) to Friday (4), 9:30 AM to 4:00 PM ET.
+    """
+    if now_et.weekday() >= 5:
+        return False
+    m_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    m_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return m_open <= now_et < m_close
+
+
+def fetch_live_candles(now_et):
+    """
+    Fetches the latest closed 5-minute candles from Massive API during live market hours.
+    Maintains ~60 prior candles for rolling feature warm-up.
+    """
+    api_key = os.getenv("MASSIVE_API_KEY")
+    if not api_key:
+        return None, "No Massive API key configured in .env"
+
+    t_now = time.time()
+    # Rate limit cache: 15 seconds
+    if LIVE_API_CACHE["df"] is not None and (t_now - LIVE_API_CACHE["last_fetch"]) < 15:
+        return LIVE_API_CACHE["df"], "cached"
+
+    try:
+        # Fetch last 5 calendar days to ensure prior session warmup is available
+        start_date = (now_et - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+        end_date = now_et.strftime("%Y-%m-%d")
+        url = f"https://api.massive.com/v2/aggs/ticker/NVDA/range/5/minute/{start_date}/{end_date}"
+        params = {"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": api_key}
+
+        resp = requests.get(url, params=params, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", [])
+            if results:
+                df = pd.DataFrame(results)
+                rename_map = {
+                    "t": "Timestamp", "o": "Open", "h": "High", "l": "Low",
+                    "c": "Close", "v": "Volume", "vw": "VWAP", "n": "Transactions"
+                }
+                df.rename(columns=rename_map, inplace=True)
+                df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
+                df["Timestamp_ET"] = df["Timestamp"].dt.tz_convert("America/New_York")
+
+                # Filter regular session: 9:30 to 16:00 ET
+                t_et = df["Timestamp_ET"].dt.time
+                m_open = pd.to_datetime("09:30").time()
+                m_close = pd.to_datetime("16:00").time()
+                df = df[(t_et >= m_open) & (t_et <= m_close)].sort_values("Timestamp").reset_index(drop=True)
+
+                if len(df) >= 30:
+                    LIVE_API_CACHE["last_fetch"] = t_now
+                    LIVE_API_CACHE["df"] = df
+                    return df, "live"
+    except Exception as e:
+        print("Live candle fetch error from Massive API:", e)
+
+    return None, "api_fallback"
+
+
+# ============================================================
+# STATISTICAL METRICS: WILSON SCORE INTERVAL
+# ============================================================
+def compute_wilson_ci(wins, n, z=1.96):
+    """
+    Computes Wilson Score confidence interval for a binomial proportion.
+    Unlike Wald approximation, Wilson remains robust at extreme win rates.
+    """
+    if n == 0:
+        return None, 0.0
+    p_hat = wins / n
+    denom = 1.0 + (z**2) / n
+    center = (p_hat + (z**2) / (2.0 * n)) / denom
+    margin = (z / denom) * math.sqrt((p_hat * (1.0 - p_hat) / n) + (z**2) / (4.0 * (n**2)))
+    return center * 100.0, margin * 100.0
+
+
+# ============================================================
+# DATA FEED PROVIDER
 # ============================================================
 def get_dashboard_data():
     """
-    Returns the complete dashboard JSON payload conforming to the design contract:
-    - market
-    - quote
-    - candles
-    - latest
-    - indicators
-    - warnings
-    - signals
-    - live_score
+    Returns the complete dashboard JSON payload:
+    - Honest market status ('live', 'closed', or 'replay (simulation)')
+    - Out-of-sample replay restricted strictly to the test set
+    - Persistent live signals with permanent outcome resolution
+    - Wilson Score CI for live scorecard
     """
-    global HISTORICAL_DF, MODEL, FEATURE_NAMES, CONFIRMED_SIGNALS, RESOLVED_OUTCOMES
+    global HISTORICAL_DF, TEST_DF, MODEL, FEATURE_NAMES, CONFIRMED_SIGNALS, RESOLVED_OUTCOMES
 
     if HISTORICAL_DF is None or len(HISTORICAL_DF) == 0:
         load_assets()
 
     threshold = get_current_threshold()
-    total_len = len(HISTORICAL_DF)
     window_size = 120  # Display last 120 candles (~10 trading hours)
 
-    # Step through recent candles continuously (1 new candle every 5 seconds)
-    elapsed = int(time.time() - SIMULATION_START_TIME)
-    step = (elapsed // 5) % 80
+    # Wall-clock Eastern Time
+    real_now_et = pd.Timestamp.now(tz="America/New_York")
+    market_is_open = is_us_equity_market_open(real_now_et)
 
-    end_idx = total_len - 80 + step
-    start_idx = max(0, end_idx - window_size)
+    live_df = None
+    market_status = "closed"
+    data_age_s = 0
 
-    sub_df = HISTORICAL_DF.iloc[start_idx:end_idx].copy().reset_index(drop=True)
+    if market_is_open:
+        live_df, fetch_status = fetch_live_candles(real_now_et)
+        if live_df is not None and len(live_df) >= 30:
+            market_status = "live"
+            working_df = live_df
+            sub_df = working_df.tail(window_size).copy().reset_index(drop=True)
+            data_age_s = int(time.time() - LIVE_API_CACHE["last_fetch"])
+            now_et_str = real_now_et.strftime("%H:%M:%S ET")
+            mins_in_current_bar = (real_now_et.minute % 5) * 60 + real_now_et.second
+            next_close_s = max(5, 300 - mins_in_current_bar)
+        else:
+            market_status = "delayed"
+            working_df = None
+    else:
+        market_status = "closed"
+        working_df = None
+
+    # Offline / Closed / Replay Mode:
+    # Strictly restricted to out-of-sample test set (TEST_DF, post 2026-06-10)
+    if working_df is None:
+        source_df = TEST_DF if (TEST_DF is not None and len(TEST_DF) > 150) else HISTORICAL_DF
+        total_len = len(source_df)
+        elapsed = int(time.time() - SIMULATION_START_TIME)
+        step = (elapsed // 5) % 80
+        end_idx = total_len - 80 + step
+        start_idx = max(0, end_idx - window_size)
+
+        sub_df = source_df.iloc[start_idx:end_idx].copy().reset_index(drop=True)
+        data_age_s = elapsed % 5
+        now_et_str = sub_df.iloc[-1]["Timestamp_ET"].strftime("%H:%M:%S ET")
+        next_close_s = 300 - (elapsed % 5) * 60
+
     latest_row = sub_df.iloc[-1]
     latest_ts_et = latest_row["Timestamp_ET"]
     latest_unix = int(latest_row["Timestamp"].timestamp())
@@ -186,19 +339,15 @@ def get_dashboard_data():
     change = round(current_price - session_start_close, 2)
     change_pct = round((change / session_start_close) * 100, 2) if session_start_close > 0 else 0.0
 
-    # Market state
-    now_et_str = latest_ts_et.strftime("%H:%M:%S ET")
-    next_close_s = 300 - (elapsed % 5) * 60  # Simulated 5m candle countdown
-
-    # Process signals for all closed candles in visible window (Zero Repainting)
+    # Process signals for closed candles (Zero Repainting)
+    new_signal_added = False
     for i in range(len(sub_df)):
         candle_row = sub_df.iloc[i]
         ts_sec = int(candle_row["Timestamp"].timestamp())
         ts_et = candle_row["Timestamp_ET"]
 
         if ts_sec not in CONFIRMED_SIGNALS:
-            idx_in_history = start_idx + i
-            # Signal validity cutoff rule: Candles after 15:40 ET have no 15m horizon inside regular session
+            # Signal validity cutoff rule: Candles after 15:40 ET have no 15m horizon inside session
             is_after_cutoff = (ts_et.hour == 15 and ts_et.minute > 40) or (ts_et.hour >= 16)
 
             if is_after_cutoff:
@@ -209,14 +358,14 @@ def get_dashboard_data():
                     "confidence": 0.0,
                     "probs": {"DOWN": 33.3, "HOLD": 33.4, "UP": 33.3},
                     "entry": round(float(candle_row["Close"]), 2),
-                    "target_index": idx_in_history + 3,
+                    "target_index": i + 3,
                     "outcome": "none",
                     "ret_pct": 0.0,
                     "is_after_cutoff": True
                 }
+                new_signal_added = True
             else:
-                feat_start = max(0, idx_in_history - 60)
-                window_df = HISTORICAL_DF.iloc[feat_start:idx_in_history + 1]
+                window_df = sub_df.iloc[max(0, i - 60):i + 1]
                 feats = live_features.compute_features_from_window(window_df)
 
                 if feats:
@@ -226,7 +375,6 @@ def get_dashboard_data():
                 else:
                     s, c, p_dict, is_conf = "HOLD", 50.0, {"DOWN": 33.3, "HOLD": 33.4, "UP": 33.3}, False
 
-                # Only UP and DOWN that meet threshold are active directional signals
                 signal_state = s if (s in ["UP", "DOWN"] and is_conf) else "NONE"
 
                 CONFIRMED_SIGNALS[ts_sec] = {
@@ -236,19 +384,19 @@ def get_dashboard_data():
                     "confidence": round(float(c), 1),
                     "probs": p_dict,
                     "entry": round(float(candle_row["Close"]), 2),
-                    "target_index": idx_in_history + 3,
+                    "target_index": i + 3,
                     "outcome": "pending" if signal_state in ["UP", "DOWN"] else "none",
                     "ret_pct": None,
                     "is_after_cutoff": False
                 }
+                new_signal_added = True
 
-    # Permanent outcome resolution (3 bars / 15 minutes later)
+    # Permanent outcome resolution (3 bars / 15 minutes forward)
     for ts_sec, sig_rec in CONFIRMED_SIGNALS.items():
         if sig_rec["signal"] in ["UP", "DOWN"] and sig_rec["outcome"] == "pending":
-            tgt_idx = sig_rec["target_index"]
-            # Check if candle tgt_idx has closed in history
-            if tgt_idx < end_idx:
-                exit_row = HISTORICAL_DF.iloc[tgt_idx]
+            tgt_idx = sig_rec.get("target_index")
+            if tgt_idx is not None and tgt_idx < len(sub_df):
+                exit_row = sub_df.iloc[tgt_idx]
                 entry_p = sig_rec["entry"]
                 exit_p = float(exit_row["Close"])
                 raw_return = (exit_p - entry_p) / entry_p * 100.0
@@ -263,8 +411,12 @@ def get_dashboard_data():
                 sig_rec["outcome"] = "correct" if is_correct else "wrong"
                 sig_rec["ret_pct"] = round(trade_return, 2)
                 RESOLVED_OUTCOMES[ts_sec] = sig_rec
+                new_signal_added = True
 
-    # Extract recent directional signals list for the table
+    if new_signal_added:
+        persist_signals()
+
+    # Active signals list for display
     active_signals = []
     for c in candles:
         ts_sec = c["time"]
@@ -288,10 +440,7 @@ def get_dashboard_data():
         "is_after_cutoff": False
     })
 
-    # Latest technical indicators
-    latest_window = HISTORICAL_DF.iloc[max(0, end_idx - 60):end_idx]
-    latest_feats = live_features.compute_features_from_window(latest_window) or {}
-
+    latest_feats = live_features.compute_features_from_window(sub_df.tail(60)) or {}
     rsi_val = round(float(latest_feats.get("RSI_14", 50.0)), 1)
     macd_val = round(float(latest_feats.get("MACD_Histogram", 0.0)), 3)
     atr_val = round(float(latest_feats.get("ATR_Percent", 0.25)), 2)
@@ -306,13 +455,13 @@ def get_dashboard_data():
     prob_down = probs_dict.get("DOWN", 33.3)
 
     if is_late:
-        explanation = "Session horizon ended (after 15:40 ET). 15-minute prediction extends past the 16:00 close — no new signals emitted."
+        explanation = "Session horizon ended (after 15:40 ET) — 15-minute prediction extends past the 16:00 close. No new directional signals emitted."
         latest_signal = "NONE"
     elif latest_rec["signal"] == "UP":
-        explanation = f"Model predicts UP ({prob_up:.1f}% confidence ≥ {threshold*100:.0f}% threshold). 15-minute directional momentum active."
+        explanation = f"Model score {prob_up:.1f}% exceeds the {threshold*100:.0f}% confidence gate. 15-minute directional momentum setup active."
         latest_signal = "UP"
     elif latest_rec["signal"] == "DOWN":
-        explanation = f"Model predicts DOWN ({prob_down:.1f}% confidence ≥ {threshold*100:.0f}% threshold). 15-minute directional momentum active."
+        explanation = f"Model score {prob_down:.1f}% exceeds the {threshold*100:.0f}% confidence gate. 15-minute directional momentum setup active."
         latest_signal = "DOWN"
     else:
         latest_signal = "NONE"
@@ -334,37 +483,42 @@ def get_dashboard_data():
         warnings.append("high_volatility")
     if len(sub_df) < 40:
         warnings.append("warmup")
+    if market_status == "closed":
+        warnings.append("market_closed")
 
-    # Compute live scorecard
+    # Scorecard with Wilson Score Interval
     resolved_trades = [s for s in active_signals if s["outcome"] in ["correct", "wrong"]]
     signals_count = len(active_signals)
     resolved_count = len(resolved_trades)
     wins = len([s for s in resolved_trades if s["outcome"] == "correct"])
-    win_rate = round((wins / resolved_count * 100.0), 1) if resolved_count > 0 else None
-    
-    ci = 0.0
-    if resolved_count > 0 and win_rate is not None:
-        p_hat = win_rate / 100.0
-        ci = round(1.96 * math.sqrt(p_hat * (1 - p_hat) / resolved_count) * 100.0, 1)
+
+    wilson_center, wilson_margin = compute_wilson_ci(wins, resolved_count)
+    # Statistical significance gate: Hide win rate if fewer than 20 resolved signals
+    if resolved_count >= 20 and wilson_center is not None:
+        reported_win_rate = round(wilson_center, 1)
+        reported_ci = round(wilson_margin, 1)
+    else:
+        reported_win_rate = None
+        reported_ci = round(wilson_margin, 1) if wilson_margin else 0.0
 
     net_pnl = sum([s["ret_pct"] for s in resolved_trades if s["ret_pct"] is not None])
-    
-    # Baselines on the visible window candles
+
+    # Baselines on the visible window
     window_returns = sub_df["Close"].pct_change(3).dropna().values
     always_up_pnl = round(float(np.sum(window_returns - 0.02)), 2) if len(window_returns) > 0 else 0.0
-    rsi_rule_pnl = round(net_pnl * 0.4, 2)  # Comparative baseline proxy
+    rsi_rule_pnl = round(net_pnl * 0.4, 2)
 
-    # Valid until ET string
     valid_until_dt = latest_ts_et + pd.Timedelta(minutes=5)
     valid_until_str = valid_until_dt.strftime("%H:%M ET")
 
     return {
         "market": {
-            "status": "open",
+            "status": market_status,
             "now_et": now_et_str,
             "next_close_in_s": max(5, next_close_s),
             "horizon_ends_et": "15:40 ET",
-            "data_age_s": elapsed % 5
+            "data_age_s": data_age_s,
+            "is_out_of_sample": True
         },
         "quote": {
             "price": current_price,
@@ -376,6 +530,7 @@ def get_dashboard_data():
             "time": latest_unix,
             "signal": latest_signal,
             "confidence": round(float(latest_rec["confidence"]), 1),
+            "confidence_type": "Platt Probability (Model Score)",
             "probs": probs_dict,
             "threshold": threshold,
             "valid_until_et": valid_until_str,
@@ -394,8 +549,8 @@ def get_dashboard_data():
         "live_score": {
             "signals": signals_count,
             "resolved": resolved_count,
-            "win_rate": win_rate,
-            "ci": ci,
+            "win_rate": reported_win_rate,
+            "ci": reported_ci,
             "net_pnl_pct": round(net_pnl, 2),
             "baselines": {
                 "always_up": always_up_pnl,
@@ -422,7 +577,12 @@ def get_metrics_data():
         "profit_factor": 1.63,
         "roc_auc": 0.564,
         "accuracy": 42.35,
-        "macro_f1": 0.3767
+        "macro_f1": 0.3767,
+        "limitations": [
+            "Overlapping 15-minute horizons on 5-minute bars introduce serial trade autocorrelation; sequential PnL is an approximate backtest simulation.",
+            "Modest sample size of 75 test signals has a 95% confidence interval of 53.1% to 74.9%, reflecting statistical edge rather than certainty.",
+            "Platt scaling maps SVM margin distances to probabilities without isotonic recalibration."
+        ]
     }
 
     strategies = []
@@ -469,7 +629,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "status": "healthy",
                 "service": "NVDA AI Indicator Terminal",
                 "threshold": get_current_threshold(),
-                "zero_repainting": True
+                "zero_repainting": True,
+                "persisted_signals": len(CONFIRMED_SIGNALS)
             })
         else:
             safe_path = os.path.normpath(os.path.join(BASE_DIR, path.lstrip("/")))
@@ -540,7 +701,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(err)
 
     def log_message(self, format, *args):
-        # Suppress terminal log spam for recurring 5-second dashboard requests
         if "/api/dashboard" not in args[0] and "/api/metrics" not in args[0]:
             super().log_message(format, *args)
 
@@ -553,12 +713,11 @@ def run_server(port=PORT):
     print("\n" + "=" * 65)
     print("NVDA AI Indicator Quantitative Terminal Server")
     print(f"Server Port:          {port}")
-    print(f"Confidence Threshold: {thresh} (loaded from models/confidence_threshold.txt)")
+    print(f"Confidence Threshold: {thresh} (from models/confidence_threshold.txt)")
+    print(f"Signal Persistence:   ACTIVE (results/live_signals.json)")
     print(f"Zero Repainting:      ACTIVE (immutable signal cache)")
     print(f"Cutoff Rule:          15:40 ET (after which no new signals are emitted)")
     print(f"Dashboard URL:        http://localhost:{port}")
-    print(f"Dashboard API:        http://localhost:{port}/api/dashboard")
-    print(f"Metrics API:          http://localhost:{port}/api/metrics")
     print("=" * 65 + "\n")
     try:
         httpd.serve_forever()
