@@ -90,39 +90,8 @@ print("Dataset shape:", df.shape)
 # 3. SELECT MODEL FEATURES
 # ============================================================
 
-FEATURES = [
-    "Return_1",
-    "Return_3",
-    "Return_6",
-    "Return_12",
-    "Return_24",
-    "High_Low_Range",
-    "Close_Open_Return",
-    "EMA_9_Distance",
-    "EMA_20_Distance",
-    "EMA_50_Distance",
-    "RSI_14",
-    "MACD",
-    "MACD_Signal",
-    "MACD_Histogram",
-    "BB_Width",
-    "BB_Percent_B",
-    "ATR_Percent",
-    "Log_Volume",
-    "Relative_Volume",
-    "Volume_Change",
-    "OBV_Normalized",
-    "Minutes_Since_Open",
-    "Time_Sin",
-    "Time_Cos",
-    "Weekday_Sin",
-    "Weekday_Cos"
-]
-
-# Optional features
-for feature in ["VWAP_Distance", "Log_Transactions"]:
-    if feature in df.columns:
-        FEATURES.append(feature)
+import live_features
+FEATURES = live_features.FEATURE_NAMES
 
 missing_features = [
     feature for feature in FEATURES
@@ -596,9 +565,19 @@ print("\nSelected model:", best_model_name)
 # 11. EVALUATE SELECTED MODEL ON TEST DATA
 # ============================================================
 
+print("\nRefitting selected model on Train + Validation combined data...")
+X_train_val = pd.concat([X_train, X_val], axis=0)
+y_train_val = pd.concat([y_train, y_val], axis=0)
+
 print("\nEvaluating selected model on untouched test data...")
 
 if best_model_name == "Soft Voting Ensemble":
+    for name in ensemble_names:
+        if name == "XGBoost":
+            sw_tv = compute_sample_weight("balanced", y_train_val)
+            trained_models[name].fit(X_train_val, y_train_val, sample_weight=sw_tv)
+        else:
+            trained_models[name].fit(X_train_val, y_train_val)
 
     test_probabilities = np.mean(
         [
@@ -622,6 +601,12 @@ else:
     best_model_object = trained_models[
         best_model_name
     ]
+
+    if best_model_name == "XGBoost":
+        sw_tv = compute_sample_weight("balanced", y_train_val)
+        best_model_object.fit(X_train_val, y_train_val, sample_weight=sw_tv)
+    else:
+        best_model_object.fit(X_train_val, y_train_val)
 
     test_predictions = best_model_object.predict(
         X_test
@@ -744,28 +729,34 @@ print("\nRunning simulated trading backtest (with transaction costs)...")
 
 def simulate_trading(pred_labels, future_returns, cost_pct=0.02):
     pnl = []
-    active_mask = []
     wins = 0
     active_count = 0
+    gross_win = 0.0
+    gross_loss = 0.0
     
     for p, r in zip(pred_labels, future_returns):
         is_up = (p == 2 or p == "UP")
         is_down = (p == 0 or p == "DOWN")
         if is_up:
-            pnl.append(r - cost_pct)
-            active_mask.append(True)
+            trade_pnl = r - cost_pct
+            pnl.append(trade_pnl)
             active_count += 1
             if r > 0:
                 wins += 1
+                gross_win += r
+            else:
+                gross_loss += abs(r)
         elif is_down:
-            pnl.append(-r - cost_pct)
-            active_mask.append(True)
+            trade_pnl = -r - cost_pct
+            pnl.append(trade_pnl)
             active_count += 1
             if r < 0:
                 wins += 1
+                gross_win += (-r)
+            else:
+                gross_loss += abs(r)
         else:
             pnl.append(0.0)
-            active_mask.append(False)
             
     pnl = pd.Series(pnl)
     equity = (1.0 + pnl / 100.0).cumprod()
@@ -774,19 +765,22 @@ def simulate_trading(pred_labels, future_returns, cost_pct=0.02):
     win_rate = (wins / active_count * 100.0) if active_count > 0 else 0.0
     coverage = (active_count / len(pred_labels) * 100.0) if len(pred_labels) > 0 else 0.0
     
-    active_pnl = pnl[active_mask]
-    if len(active_pnl) > 5 and active_pnl.std() > 0:
-        sharpe = (active_pnl.mean() / active_pnl.std()) * np.sqrt(78 * 252)
+    if active_count > 0:
+        p_hat = win_rate / 100.0
+        ci = 1.96 * np.sqrt(p_hat * (1 - p_hat) / active_count) * 100.0
+        win_str = f"{win_rate:.1f}% ± {ci:.1f}%"
     else:
-        sharpe = 0.0
+        win_str = "0.0%"
+        
+    pf = (gross_win / (gross_loss + 1e-6)) if gross_loss > 0 else 1.0
 
     return {
         "Signals": active_count,
         "Coverage_Pct": round(coverage, 1),
-        "Win_Rate_Pct": round(win_rate, 1),
+        "Win_Rate_95_CI": win_str,
         "Net_PnL_Pct": round(total_net_pnl, 2),
         "Max_Drawdown_Pct": round(max_dd, 2),
-        "Sharpe_Ratio": round(sharpe, 2)
+        "Profit_Factor": round(pf, 2)
     }
 
 # Find optimal confidence threshold on validation set
@@ -796,17 +790,19 @@ val_probabilities = (
     else trained_models[best_model_name].predict_proba(X_val)
 )
 
-best_val_thresh = 0.40
-best_val_ret = -999.0
+best_val_thresh = 0.44
+best_val_wr = 0.0
 val_fut_ret = val_df["Future_Return"].values
 
-for th in np.arange(0.35, 0.50, 0.02):
+for th in np.arange(0.36, 0.48, 0.02):
     th = round(float(th), 2)
     gated_val = np.where((val_probabilities[:, 2] >= th) & (val_probabilities[:, 2] > val_probabilities[:, 0]), "UP",
                 np.where((val_probabilities[:, 0] >= th) & (val_probabilities[:, 0] > val_probabilities[:, 2]), "DOWN", "HOLD"))
     sim_res = simulate_trading(gated_val, val_fut_ret)
-    if sim_res["Signals"] >= 30 and sim_res["Net_PnL_Pct"] > best_val_ret:
-        best_val_ret = sim_res["Net_PnL_Pct"]
+    # Optimize for precision / win-rate with significant signal sample (>= 50 signals)
+    wr_numeric = float(sim_res["Win_Rate_95_CI"].split("%")[0])
+    if sim_res["Signals"] >= 50 and wr_numeric > best_val_wr:
+        best_val_wr = wr_numeric
         best_val_thresh = th
 
 print(f"Optimal validation confidence threshold: {best_val_thresh}")
@@ -844,7 +840,7 @@ t_maj["Strategy"] = "Majority Class Baseline"
 trading_rows.append(t_maj)
 
 trading_metrics_df = pd.DataFrame(trading_rows)[
-    ["Strategy", "Signals", "Coverage_Pct", "Win_Rate_Pct", "Net_PnL_Pct", "Max_Drawdown_Pct", "Sharpe_Ratio"]
+    ["Strategy", "Signals", "Coverage_Pct", "Win_Rate_95_CI", "Net_PnL_Pct", "Max_Drawdown_Pct", "Profit_Factor"]
 ]
 
 trading_metrics_df.to_csv(
