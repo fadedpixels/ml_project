@@ -61,9 +61,11 @@ An enterprise-grade, leak-free AI trading indicator system that forecasts NVIDIA
 - **Problem:** Dynamic chart markers that recompute past signals over moving windows repaint history, invalidating trading evaluation.
 - **Solution:** `app.py` implements a persistent `CONFIRMED_SIGNALS` cache. Once a candle closes at $T$, its prediction and confidence are locked permanently and will never change on subsequent polls.
 
-### D. Confidence Gating (Meta-Filtering)
-- **Problem:** Blind argmax classification forces trades on noisy bars with 35–38% class probabilities. Round-trip transaction friction (2 bps) quickly erodes capital.
-- **Solution:** Directional positions (UP / DOWN) are taken only when probability exceeds the validation-calibrated threshold $\tau = 0.44$. In ambiguous regimes, the indicator safely outputs **HOLD**.
+### D. Pure Out-of-Sample Confidence Gating (Meta-Filtering)
+- **Problem:** Blind argmax classification forces trades on noisy bars with 35–38% class probabilities. Round-trip transaction friction (2 bps) quickly erodes capital (-55.55% PnL).
+- **Solution:** Directional positions (UP / DOWN) are taken only when probability exceeds the threshold $\tau = 0.44$.
+- **Leakage Prevention:** To avoid in-sample leakage, the threshold $\tau = 0.44$ was selected on **pure out-of-sample pre-refit validation probabilities** targeting fixed ~1.0%–1.5% operational coverage (top conviction decile). The model was then refit on Train+Val with that locked threshold.
+- **Session Cutoff Rule:** Candles after 15:40 ET have $<15$ minutes remaining before the 16:00 close; the system suppresses directional signals to eliminate boundary artifacts.
 
 ---
 
@@ -98,10 +100,11 @@ Simulated across all test candles with realistic 2 bps round-trip friction and 9
 | Always UP Baseline | 7,450 | 100.0% | 48.8% ± 1.1% | -83.68% | -84.72% | 0.96 |
 | Majority Class (All HOLD) | 0 | 0.0% | 0.0% | 0.00% | 0.00% | 1.00 |
 
-#### Quantitative Insights:
+#### Quantitative Insights & Honest Academic Limits:
 1. **Raw ML bleeds under friction:** Blindly trading every 15 minutes incurs massive drag from bid-ask spread and slippage (-55.55% PnL, -55.84% drawdown).
-2. **Confidence Gating protects capital:** Filtering for high-conviction bars boosts directional accuracy to 64.0%, curtails drawdown to -4.42%, and yields positive net alpha (+3.82% net, 1.63 profit factor).
-3. **Statistical Integrity:** Rather than reporting ungrounded high Sharpe ratios on sparse trade counts, we report 95% confidence intervals and profit factors reflecting true statistical uncertainty.
+2. **Confidence Gating preserves capital:** Filtering for high-conviction bars boosts directional accuracy to 64.0%, curtails drawdown to -4.42%, and yields positive net alpha (+3.82% net, 1.63 profit factor).
+3. **Modest Evidence of Edge:** On 75 test signals, the 64.0% win rate carries a 95% confidence interval of 53.1% – 74.9%. This reflects modest evidence of statistical edge under selective coverage, not risk-free arbitrage.
+4. **Overlapping Horizons:** Because 15-minute holding windows on 5-minute bars overlap across 3 consecutive candles, consecutive trade returns exhibit serial autocorrelation. Sequential PnL is an approximate backtest simulation.
 
 ---
 
