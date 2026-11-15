@@ -562,6 +562,47 @@ if best_model_name in [
 print("\nSelected model:", best_model_name)
 
 # ============================================================
+# 10B. OUT-OF-SAMPLE CONFIDENCE THRESHOLD TUNING (PRE-REFIT)
+# We tune the threshold strictly on validation probabilities from the
+# model trained on training data only (pre-refit), avoiding in-sample leakage.
+# Criteria: Precision at fixed target coverage (~1.0% - 1.5% of candles).
+# ============================================================
+
+print("\nTuning confidence threshold on pure out-of-sample validation data...")
+val_probabilities = (
+    np.mean([trained_models[name].predict_proba(X_val) for name in ensemble_names], axis=0)
+    if best_model_name == "Soft Voting Ensemble"
+    else trained_models[best_model_name].predict_proba(X_val)
+)
+
+val_fut_ret = val_df["Future_Return"].values
+best_val_thresh = 0.44
+target_coverage = 1.5  # ~1.0% - 1.5% coverage (1-2 signals per trading day)
+best_diff = 999.0
+
+print("\n--- OUT-OF-SAMPLE VALIDATION THRESHOLD SEARCH ---")
+for th in np.arange(0.36, 0.48, 0.02):
+    th = round(float(th), 2)
+    up_idx = (val_probabilities[:, 2] >= th) & (val_probabilities[:, 2] > val_probabilities[:, 0])
+    down_idx = (val_probabilities[:, 0] >= th) & (val_probabilities[:, 0] > val_probabilities[:, 2])
+    n_tot = int(up_idx.sum() + down_idx.sum())
+    if n_tot > 0:
+        win_up = (val_fut_ret[up_idx] > 0).sum()
+        win_down = (val_fut_ret[down_idx] < 0).sum()
+        wr = (win_up + win_down) / n_tot * 100
+        cov = n_tot / len(val_df) * 100
+        ci = 1.96 * np.sqrt((wr / 100) * (1 - wr / 100) / n_tot) * 100
+        print(f"Candidate Tau {th:.2f}: {n_tot:4d} signals ({cov:4.1f}% coverage) | Precision: {wr:.1f}% ± {ci:.1f}%")
+        diff = abs(cov - target_coverage)
+        if diff < best_diff and wr >= 52.0:
+            best_diff = diff
+            best_val_thresh = th
+
+print(f"\nLocked Out-of-Sample Confidence Threshold: {best_val_thresh}")
+with open(os.path.join(MODEL_DIR, "confidence_threshold.txt"), "w") as f:
+    f.write(str(best_val_thresh))
+
+# ============================================================
 # 11. EVALUATE SELECTED MODEL ON TEST DATA
 # ============================================================
 
@@ -783,29 +824,8 @@ def simulate_trading(pred_labels, future_returns, cost_pct=0.02):
         "Profit_Factor": round(pf, 2)
     }
 
-# Find optimal confidence threshold on validation set
-val_probabilities = (
-    np.mean([trained_models[name].predict_proba(X_val) for name in ensemble_names], axis=0)
-    if best_model_name == "Soft Voting Ensemble"
-    else trained_models[best_model_name].predict_proba(X_val)
-)
-
-best_val_thresh = 0.44
-best_val_wr = 0.0
-val_fut_ret = val_df["Future_Return"].values
-
-for th in np.arange(0.36, 0.48, 0.02):
-    th = round(float(th), 2)
-    gated_val = np.where((val_probabilities[:, 2] >= th) & (val_probabilities[:, 2] > val_probabilities[:, 0]), "UP",
-                np.where((val_probabilities[:, 0] >= th) & (val_probabilities[:, 0] > val_probabilities[:, 2]), "DOWN", "HOLD"))
-    sim_res = simulate_trading(gated_val, val_fut_ret)
-    # Optimize for precision / win-rate with significant signal sample (>= 50 signals)
-    wr_numeric = float(sim_res["Win_Rate_95_CI"].split("%")[0])
-    if sim_res["Signals"] >= 50 and wr_numeric > best_val_wr:
-        best_val_wr = wr_numeric
-        best_val_thresh = th
-
-print(f"Optimal validation confidence threshold: {best_val_thresh}")
+# Apply confidence gating on test set using the locked threshold
+print(f"\nApplying locked out-of-sample confidence threshold: {best_val_thresh}")
 
 # Apply confidence gating on test set
 test_fut_ret = test_df["Future_Return"].values
