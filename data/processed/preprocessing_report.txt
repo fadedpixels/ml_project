@@ -1,0 +1,37 @@
+NVDA STOCK DATA PREPROCESSING REPORT
+=============================================
+
+Initial rows: 38747
+Final rows: 38747
+Rows removed: 0
+Invalid timestamps removed: 0
+Duplicate records removed: 0
+Missing essential values removed: 0
+Negative volume records: 0
+Invalid OHLC records removed: 0
+Rows removed by session filter: 0
+Missing expected 5-minute intervals: 175
+
+Final dataset shape: (38747, 9)
+
+Remaining missing values:
+Timestamp       0
+Timestamp_ET    0
+Open            0
+High            0
+Low             0
+Close           0
+Volume          0
+VWAP            0
+Transactions    0
+
+Statistical summary:
+               Open          High           Low         Close        Volume          VWAP   Transactions
+count  38747.000000  38747.000000  38747.000000  38747.000000  3.874700e+04  38747.000000   38747.000000
+mean     173.699300    173.959499    173.426538    173.697209  2.012255e+06    173.696597   26290.029938
+std       35.268121     35.277965     35.256874     35.265133  1.782038e+06     35.266651   20677.157467
+min       87.460000     88.720000     86.620000     87.511900  2.160684e+05     87.369800       1.000000
+25%      141.652500    141.860000    141.450000    141.646850  1.004268e+06    141.645850   12066.000000
+50%      180.790000    181.070000    180.500000    180.790000  1.485527e+06    180.790500   18313.000000
+75%      200.025000    200.330000    199.662500    200.025000  2.372162e+06    200.002150   36946.500000
+max      242.605000    243.370000    242.170000    242.610000  4.257948e+07    242.638400  378241.000000

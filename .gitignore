@@ -1,5 +1,28 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-
-.env
-venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Environment variables & secrets (CRITICAL: never commit API keys)
+.env
+.env.*
+!.env.example
+
+# Operating System & IDE artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary and log files
+*.log
+out.log
+err.log

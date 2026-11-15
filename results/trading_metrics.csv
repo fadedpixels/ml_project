@@ -1,0 +1,6 @@
+Strategy,Signals,Coverage_Pct,Win_Rate_Pct,Net_PnL_Pct,Max_Drawdown_Pct,Sharpe_Ratio
+SVM (Confidence Gated @ 0.47),31,1.2,61.3,3.23,-2.04,38.61
+SVM (Raw Argmax),989,38.5,51.7,-9.02,-21.78,-4.23
+Basic RSI Rule Baseline,148,5.8,64.2,10.15,-3.28,36.47
+Always UP Baseline,2569,100.0,47.6,-54.56,-58.02,-18.27
+Majority Class Baseline,0,0.0,0.0,0.0,0.0,0.0
